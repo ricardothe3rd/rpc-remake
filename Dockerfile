@@ -1,0 +1,58 @@
+# Multi-stage Dockerfile for Remake RPC
+# Stage 1: Build React frontend
+# Stage 2: Python backend + built frontend
+
+# ============================================================================
+# Stage 1: Build Frontend
+# ============================================================================
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /app/frontend
+
+# Copy package files
+COPY frontend/package*.json ./
+
+# Install dependencies
+RUN npm ci --legacy-peer-deps
+
+# Copy frontend source
+COPY frontend/ ./
+
+# Build production frontend
+RUN npm run build
+
+# ============================================================================
+# Stage 2: Python Backend
+# ============================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Python dependencies
+COPY backend/requirements.txt ./
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend code
+COPY backend/ ./
+
+# Copy built frontend from stage 1
+COPY --from=frontend-builder /app/frontend/dist ./static
+
+# Expose port (dynamic via environment variable)
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s \
+    CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
+
+# Start server
+# Note: PORT is set by Remake Platform, defaults to 8080
+CMD ["sh", "-c", "python main.py"]
