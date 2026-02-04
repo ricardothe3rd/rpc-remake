@@ -12,8 +12,16 @@ WORKDIR /app/frontend
 # Copy package files
 COPY frontend/package*.json ./
 
+# Debug: Show what files we have and Node/npm versions
+RUN echo "=== DEBUG INFO ===" && \
+    node --version && \
+    npm --version && \
+    ls -la && \
+    cat package.json && \
+    echo "=== END DEBUG ==="
+
 # Install dependencies
-RUN npm ci --legacy-peer-deps
+RUN npm ci --legacy-peer-deps || (echo "npm ci failed!" && cat /root/.npm/_logs/*.log 2>/dev/null && exit 1)
 
 # Copy frontend source
 COPY frontend/ ./
