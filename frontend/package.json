@@ -1,6 +1,7 @@
 {
   "name": "robot-control-frontend",
-  "version": "1.0.0",
+  "version": "1.0.1",
+  "description": "Robot control frontend - requires Node 22+ for build",
   "type": "module",
   "scripts": {
     "dev": "vite",
