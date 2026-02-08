@@ -5,23 +5,15 @@
 # ============================================================================
 # Stage 1: Build Frontend
 # ============================================================================
-FROM node:24-alpine AS frontend-builder
+FROM node:20-alpine AS frontend-builder
 
 WORKDIR /app/frontend
 
 # Copy package files
 COPY frontend/package*.json ./
 
-# Debug: Show what files we have and Node/npm versions
-RUN echo "=== DEBUG INFO ===" && \
-    node --version && \
-    npm --version && \
-    ls -la && \
-    cat package.json && \
-    echo "=== END DEBUG ==="
-
 # Install dependencies
-RUN npm ci --legacy-peer-deps || (echo "npm ci failed!" && cat /root/.npm/_logs/*.log 2>/dev/null && exit 1)
+RUN npm ci --legacy-peer-deps
 
 # Copy frontend source
 COPY frontend/ ./
@@ -59,7 +51,7 @@ EXPOSE 8080
 
 # Health check
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s \
-    CMD curl -f http://localhost:${PORT:-8080}/api/health || exit 1
+    CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
 
 # Start server
 # Note: PORT is set by Remake Platform, defaults to 8080

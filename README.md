@@ -201,15 +201,19 @@ Or click the button options for instant execution.
 
 ### Health & Status
 
-- `GET /` - Basic health check
-- `GET /health` - Detailed health with active sessions
-- `GET /sessions` - List all active sessions
-- `GET /sessions/{session_id}` - Get session details
+- `GET /api` - Basic health check
+- `GET /api/health` - Detailed health with active sessions
+- `GET /api/sessions` - List all active sessions
+- `GET /api/sessions/{session_id}` - Get session details
 
 ### Object Detection
 
-- `GET /object_detection/objects?session_id=X` - Get detected objects
-- `GET /robot/status?session_id=X` - Get robot connection status
+- `GET /api/object_detection/objects?session_id=X` - Get detected objects
+- `GET /api/robot/status?session_id=X` - Get robot connection status
+
+### Frontend
+
+- `GET /` - Serves the React frontend UI (built from `frontend/dist`)
 
 ### Socket.IO Events
 

@@ -701,7 +701,7 @@ class NavigateToPoseCommand(BaseModel):
     relative: bool = False
 
 
-@app.get("/")
+@app.get("/api")
 async def root():
     """Health check endpoint"""
     return {
@@ -711,7 +711,7 @@ async def root():
     }
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     """Detailed health check for platform"""
     return {
@@ -721,7 +721,7 @@ async def health():
     }
 
 
-@app.get("/sessions")
+@app.get("/api/sessions")
 async def list_sessions():
     """List all active sessions"""
     sessions = []
@@ -737,7 +737,7 @@ async def list_sessions():
     return {'sessions': sessions}
 
 
-@app.get("/sessions/{session_id}")
+@app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get session details"""
     session = session_state.get_session(session_id)
@@ -753,7 +753,7 @@ async def get_session(session_id: str):
     }
 
 
-@app.get("/object_detection/objects")
+@app.get("/api/object_detection/objects")
 async def get_detected_objects(session_id: str):
     """Get list of currently detected objects"""
     robot_app = session_state.get_robot_app(session_id)
@@ -766,7 +766,7 @@ async def get_detected_objects(session_id: str):
     return {"objects": [], "summary": {"total_objects": 0}, "features": []}
 
 
-@app.get("/robot/status")
+@app.get("/api/robot/status")
 async def robot_status(session_id: str):
     """Get robot connection status"""
     session = session_state.get_session(session_id)
