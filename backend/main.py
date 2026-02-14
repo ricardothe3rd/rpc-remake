@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, Optional
 from datetime import datetime
 from pathlib import Path
@@ -107,6 +108,21 @@ socket_app = socketio.ASGIApp(
 
 
 # ============================================================================
+# Session State Machine
+# ============================================================================
+
+class SessionState(str, Enum):
+    """Protocol state machine per the Three Phase Protocol Flow spec."""
+    DISCONNECTED = "disconnected"
+    PHASE_1_CONNECTING = "phase1_connecting"
+    PHASE_2_SETTING_UP = "phase2_setting_up"
+    PHASE_3_ENABLING = "phase3_enabling"
+    ACTIVE = "active"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+
+
+# ============================================================================
 # Session Model
 # ============================================================================
 
@@ -116,14 +132,14 @@ class Session:
     session_id: str
     robot_sid: Optional[str] = None
     ui_sids: list = field(default_factory=list)
-    state: str = 'waiting'  # waiting -> protocol_started -> setup_complete -> active
+    state: SessionState = SessionState.DISCONNECTED
     session_token: Optional[str] = None
     robot_app: Optional[MyRobotApp] = None
     sensor_data: dict = field(default_factory=dict)
     connected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
     def is_active(self) -> bool:
-        return self.state == 'active' and self.robot_sid is not None
+        return self.state == SessionState.ACTIVE and self.robot_sid is not None
 
 
 # Module-level lookup maps
@@ -283,7 +299,7 @@ async def handle_connect(sid: str, environ: Dict, auth: Dict = None):
         session = sessions[session_id]
         session.robot_sid = sid
         session.session_token = session_token
-        session.state = 'waiting'
+        session.state = SessionState.DISCONNECTED
 
         # Register reverse lookup
         robot_sid_to_session[sid] = session_id
@@ -363,7 +379,7 @@ async def handle_start_protocol(sid: str, data: Dict = None):
         return
 
     logger.info(f"[Phase 1] Robot ready, sending app_signature for session {session_id}")
-    session.state = 'protocol_started'
+    session.state = SessionState.PHASE_1_CONNECTING
 
     # Generate and send HMAC signature
     timestamp = datetime.utcnow().isoformat()
@@ -401,7 +417,7 @@ async def handle_signature_verified(sid: str, data: Dict = None):
         return
 
     logger.info(f"[Phase 2] Signature verified, sending setup_app_cmd for session {session_id}")
-    session.state = 'signature_verified'
+    session.state = SessionState.PHASE_2_SETTING_UP
 
     # App sends setup command TO the robot
     await sio.emit('setup_app_cmd', {
@@ -445,7 +461,7 @@ async def handle_setup_app_response(sid: str, data: Dict = None):
         )
 
         session.robot_app = robot_app
-        session.state = 'setup_complete'
+        session.state = SessionState.PHASE_3_ENABLING
         robot_app.start()
 
         logger.info(f"[Phase 2] Setup complete, MyRobotApp started for session {session_id}")
@@ -477,7 +493,7 @@ async def handle_enable_remote_control_response(sid: str, data: Dict = None):
     logger.info(f"[Phase 3] Remote control response: session={session_id}, status={status}")
 
     if status == 'enabled':
-        session.state = 'active'
+        session.state = SessionState.ACTIVE
 
         # Emit robot_ready to ALL UI clients
         await broadcast_to_ui(session_id, 'robot_ready', {
@@ -693,7 +709,7 @@ async def handle_move_command(sid: str, data: Dict):
         return
 
     session = sessions.get(session_id)
-    if not session or session.state != 'active':
+    if not session or session.state != SessionState.ACTIVE:
         await sio.emit('error', {'message': 'Session not active'}, room=sid)
         return
 
