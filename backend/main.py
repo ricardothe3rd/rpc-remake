@@ -459,10 +459,11 @@ async def handle_disconnect(sid: str):
                     except Exception as e:
                         logger.error(f"Error notifying UI {ui_sid}: {e}")
 
-                # Clean up session
-                for ui_sid in session.ui_sids:
-                    ui_sid_to_session.pop(ui_sid, None)
-                del sessions[session_id]
+                # Keep session alive for robot reconnect — clear robot ref but
+                # preserve UI client mappings so they don't need to re-join.
+                # Stale cleanup will remove truly dead sessions after 5 min.
+                session.robot_sid = None
+                session.robot_app = None
             return
 
     # Check if this was a UI client
@@ -977,7 +978,12 @@ async def handle_twist_command(sid: str, data: Dict):
     if not session or not session.robot_sid:
         return
 
-    await sio.emit('twist_command', data, room=session.robot_sid)
+    # Forward as move_cmd with twist type (protocol spec)
+    await sio.emit('move_cmd', {
+        'type': 'twist',
+        'linear_x': data.get('linear_x', 0),
+        'angular_z': data.get('angular_z', 0)
+    }, room=session.robot_sid)
 
 
 @sio.on('navigate_to_pose')
