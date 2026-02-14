@@ -36,6 +36,9 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Ensure logs stream in real-time on the platform
+ENV PYTHONUNBUFFERED=1
+
 # Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
