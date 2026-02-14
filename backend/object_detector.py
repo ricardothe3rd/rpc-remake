@@ -1,6 +1,8 @@
 import math
 import time
 import base64
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, TYPE_CHECKING, Tuple
 import logging
 import numpy as np
@@ -174,6 +176,10 @@ class ObjectDetector:
         self.scan_history = deque(maxlen=10)  # Store last 10 scans
         self.motion_threshold = 0.2  # meters
 
+        # Thread pool for offloading heavy computation (single worker to
+        # serialize detections and avoid races on shared state)
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="obj_detect")
+
         # Map data
         self.latest_map_data = None
         self.latest_robot_pose = None
@@ -196,6 +202,9 @@ class ObjectDetector:
         self.robot.remove_message_callback(self.laser_scan_message_type, self.process_scan_data)
         self.robot.remove_message_callback('map', self.update_map_data)
         self.robot.remove_message_callback('robot_pose', self.update_robot_pose)
+
+        # Shut down the thread pool executor
+        self._executor.shutdown(wait=False)
 
         # Clear any stored data
         self.detected_objects.clear()
@@ -224,8 +233,50 @@ class ObjectDetector:
             logger.error(f"Error decoding binary ranges: {e}")
             return []
 
-    def process_scan_data(self, scan_data: Dict[str, Any]) -> None:
-        """Process laser scan data and detect real objects using geometric features"""
+    def _compute_detections_sync(
+        self,
+        points: List[Tuple[float, float, float]],
+    ) -> Tuple[List['GeometricFeature'], List['DetectedObject']]:
+        """CPU-intensive detection pipeline executed in a thread pool.
+
+        This method is intentionally kept as an instance method so it can
+        read detection-parameter thresholds, but it does NOT mutate any
+        shared instance state.  The caller is responsible for applying
+        the returned results to ``self``.
+
+        Returns:
+            (features, detected_objects) ready to be stored by the caller.
+        """
+        # Detect geometric features (DBSCAN + SVD + circle/corner fitting)
+        features = self._detect_geometric_features(points)
+
+        # Classify features into objects (lightweight, but depends on map/pose
+        # snapshots captured before the thread was spawned)
+        detected_objects: List[DetectedObject] = []
+        for feature in features:
+            if feature.feature_type == 'line':
+                obj = self._classify_line_feature(feature)
+            elif feature.feature_type == 'circle':
+                obj = self._classify_circle_feature(feature)
+            elif feature.feature_type == 'corner':
+                obj = self._classify_corner_feature(feature)
+            else:
+                continue
+
+            if obj:
+                if self._is_moving_object(obj):
+                    obj.object_type = 'moving_' + obj.object_type
+                detected_objects.append(obj)
+
+        return features, detected_objects
+
+    async def process_scan_data(self, scan_data: Dict[str, Any]) -> None:
+        """Process laser scan data and detect real objects using geometric features.
+
+        Heavy computation (DBSCAN clustering, SVD line fitting, circle fitting,
+        corner detection) is offloaded to a thread pool executor so that the
+        asyncio event loop is not blocked.
+        """
         if not self.processing_enabled:
             return
 
@@ -262,15 +313,17 @@ class ObjectDetector:
                 'robot_pose': self.latest_robot_pose
             })
 
-            # Clear previous detections
-            self.detected_objects.clear()
+            # Offload the heavy computation to the thread pool executor
+            loop = asyncio.get_event_loop()
+            features, detected_objects = await loop.run_in_executor(
+                self._executor,
+                self._compute_detections_sync,
+                points,
+            )
 
-            # Detect geometric features
-            features = self._detect_geometric_features(points)
+            # Apply results back on the event loop thread
             self.detected_features = features
-
-            # Classify objects based on features and context
-            self._classify_objects(features)
+            self.detected_objects = detected_objects
 
             logger.info(f"Detected {len(self.detected_objects)} objects from {len(features)} geometric features")
 
