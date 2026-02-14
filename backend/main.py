@@ -842,9 +842,15 @@ async def handle_occupancy_grid(sid: str, data: Dict):
 # REST API Endpoints
 # ============================================================================
 
+@app.get("/health")
+async def health_check():
+    """Traefik health check endpoint — required by platform"""
+    return {"status": "ok"}
+
+
 @app.get("/api")
 async def root():
-    """Health check endpoint"""
+    """App info endpoint"""
     return {
         "app": "Remake RPC",
         "version": "2.0.0",
