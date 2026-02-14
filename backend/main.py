@@ -18,6 +18,7 @@ Version: 2.0.0
 Protocol: APP_ROBOT_PROTOCOL v1.0
 """
 
+import math
 import os
 import asyncio
 import hashlib
@@ -100,7 +101,7 @@ app.add_middleware(
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins="*",
-    logger=True,
+    logger=False,
     engineio_logger=False,
     ping_timeout=60,
     ping_interval=25
@@ -161,6 +162,7 @@ class Session:
 sessions: Dict[str, Session] = {}
 robot_sid_to_session: Dict[str, str] = {}
 ui_sid_to_session: Dict[str, str] = {}
+session_lock = asyncio.Lock()
 
 
 # ============================================================================
@@ -196,14 +198,15 @@ async def _phase_timeout(session_id: str, phase: str, timeout: int) -> None:
     except asyncio.CancelledError:
         return  # Phase completed normally, timeout cancelled
 
-    session = sessions.get(session_id)
-    if not session:
-        return
-    if session.state in (SessionState.ACTIVE, SessionState.DISCONNECTED, SessionState.TIMEOUT):
-        return  # Already completed, disconnected, or timed out
+    async with session_lock:
+        session = sessions.get(session_id)
+        if not session:
+            return
+        if session.state in (SessionState.ACTIVE, SessionState.DISCONNECTED, SessionState.TIMEOUT):
+            return  # Already completed, disconnected, or timed out
 
-    logger.warning(f"[Timeout] Phase {phase} timed out after {timeout}s for session {session_id}")
-    session.state = SessionState.TIMEOUT
+        logger.warning(f"[Timeout] Phase {phase} timed out after {timeout}s for session {session_id}")
+        session.state = SessionState.TIMEOUT
 
     # Notify UI clients
     await broadcast_to_ui(session_id, 'phase_timeout', {
@@ -224,31 +227,32 @@ async def cleanup_stale_sessions() -> None:
     """Background task: remove stale sessions every 60 seconds."""
     while True:
         await asyncio.sleep(60)
-        now = time.time()
-        stale = []
-        for session_id, session in list(sessions.items()):
-            if session.state in (SessionState.DISCONNECTED, SessionState.TIMEOUT, SessionState.ERROR):
-                if now - session.last_heartbeat > 300:  # 5 min since last activity
-                    stale.append(session_id)
-            elif session.state == SessionState.ACTIVE:
-                if now - session.last_heartbeat > Config.HEARTBEAT_TIMEOUT:
-                    logger.warning(f"[Cleanup] Session {session_id} heartbeat stale")
-                    session.state = SessionState.TIMEOUT
+        async with session_lock:
+            now = time.time()
+            stale = []
+            for session_id, session in list(sessions.items()):
+                if session.state in (SessionState.DISCONNECTED, SessionState.TIMEOUT, SessionState.ERROR):
+                    if now - session.last_heartbeat > 300:  # 5 min since last activity
+                        stale.append(session_id)
+                elif session.state == SessionState.ACTIVE:
+                    if now - session.last_heartbeat > Config.HEARTBEAT_TIMEOUT:
+                        logger.warning(f"[Cleanup] Session {session_id} heartbeat stale")
+                        session.state = SessionState.TIMEOUT
 
-        for session_id in stale:
-            session = sessions.pop(session_id, None)
-            if session:
-                session.cancel_timeout()
-                if session.robot_app:
-                    try:
-                        session.robot_app.stop()
-                    except Exception:
-                        pass
-                for ui_sid in session.ui_sids:
-                    ui_sid_to_session.pop(ui_sid, None)
-                if session.robot_sid:
-                    robot_sid_to_session.pop(session.robot_sid, None)
-                logger.info(f"[Cleanup] Removed stale session {session_id}")
+            for session_id in stale:
+                session = sessions.pop(session_id, None)
+                if session:
+                    session.cancel_timeout()
+                    if session.robot_app:
+                        try:
+                            session.robot_app.stop()
+                        except Exception:
+                            pass
+                    for ui_sid in session.ui_sids:
+                        ui_sid_to_session.pop(ui_sid, None)
+                    if session.robot_sid:
+                        robot_sid_to_session.pop(session.robot_sid, None)
+                    logger.info(f"[Cleanup] Removed stale session {session_id}")
 
 
 async def broadcast_to_ui(session_id: str, event: str, data: Dict) -> None:
@@ -277,6 +281,7 @@ class SocketIOWrapper:
         self.sio = sio_server
         self.robot_sid = robot_sid
         self.message_callbacks = []
+        self.disconnect_callbacks = []
         self._connected = True
 
     async def send_message(self, message: Dict) -> None:
@@ -305,6 +310,26 @@ class SocketIOWrapper:
     def remove_message_callback(self, callback: callable) -> None:
         if callback in self.message_callbacks:
             self.message_callbacks.remove(callback)
+
+    def add_disconnect_callback(self, callback: callable) -> None:
+        """Register a callback to be called when the robot disconnects."""
+        self.disconnect_callbacks.append(callback)
+
+    def remove_disconnect_callback(self, callback: callable) -> None:
+        """Remove a registered disconnect callback."""
+        if callback in self.disconnect_callbacks:
+            self.disconnect_callbacks.remove(callback)
+
+    def _trigger_disconnect_callbacks(self) -> None:
+        """Call all registered disconnect callbacks."""
+        self._connected = False
+        for callback in self.disconnect_callbacks:
+            try:
+                result = callback()
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as e:
+                logger.error(f"Error in disconnect callback: {e}")
 
     def is_connected(self) -> bool:
         return self._connected
@@ -372,17 +397,18 @@ async def handle_connect(sid: str, environ: Dict, auth: Dict = None):
 
         logger.info(f"[Robot] Connected: sid={sid}, session={session_id}")
 
-        # Create or update session
-        if session_id not in sessions:
-            sessions[session_id] = Session(session_id=session_id)
+        async with session_lock:
+            # Create or update session
+            if session_id not in sessions:
+                sessions[session_id] = Session(session_id=session_id)
 
-        session = sessions[session_id]
-        session.robot_sid = sid
-        session.session_token = session_token
-        session.state = SessionState.DISCONNECTED
+            session = sessions[session_id]
+            session.robot_sid = sid
+            session.session_token = session_token
+            session.state = SessionState.DISCONNECTED
 
-        # Register reverse lookup
-        robot_sid_to_session[sid] = session_id
+            # Register reverse lookup
+            robot_sid_to_session[sid] = session_id
 
         # DO NOT emit anything here — wait for start_protocol
         return True
@@ -397,37 +423,47 @@ async def handle_disconnect(sid: str):
     """Unified disconnect handler for robot and UI clients."""
 
     # Check if this was a robot
-    if sid in robot_sid_to_session:
-        session_id = robot_sid_to_session.pop(sid)
-        session = sessions.get(session_id)
+    async with session_lock:
+        if sid in robot_sid_to_session:
+            session_id = robot_sid_to_session.pop(sid)
+            session = sessions.get(session_id)
 
-        if session:
-            logger.info(f"[Robot] Disconnected: session={session_id}")
-            session.cancel_timeout()
-            session.state = SessionState.DISCONNECTED
+            if session:
+                logger.info(f"[Robot] Disconnected: session={session_id}")
+                session.cancel_timeout()
+                session.state = SessionState.DISCONNECTED
 
-            # Stop robot app
-            if session.robot_app:
-                try:
-                    session.robot_app.stop()
-                except Exception as e:
-                    logger.error(f"Error stopping robot app: {e}")
+                # Trigger disconnect callbacks on the robot transport before cleanup
+                if session.robot_app:
+                    try:
+                        transport = session.robot_app.robot.get_transport()
+                        if hasattr(transport, '_trigger_disconnect_callbacks'):
+                            transport._trigger_disconnect_callbacks()
+                    except Exception as e:
+                        logger.error(f"Error triggering disconnect callbacks: {e}")
 
-            # Notify all UI clients
-            for ui_sid in session.ui_sids:
-                try:
-                    await sio.emit('robot_disconnected', {
-                        'session_id': session_id,
-                        'timestamp': datetime.utcnow().isoformat()
-                    }, room=ui_sid)
-                except Exception as e:
-                    logger.error(f"Error notifying UI {ui_sid}: {e}")
+                # Stop robot app
+                if session.robot_app:
+                    try:
+                        session.robot_app.stop()
+                    except Exception as e:
+                        logger.error(f"Error stopping robot app: {e}")
 
-            # Clean up session
-            for ui_sid in session.ui_sids:
-                ui_sid_to_session.pop(ui_sid, None)
-            del sessions[session_id]
-        return
+                # Notify all UI clients
+                for ui_sid in session.ui_sids:
+                    try:
+                        await sio.emit('robot_disconnected', {
+                            'session_id': session_id,
+                            'timestamp': datetime.utcnow().isoformat()
+                        }, room=ui_sid)
+                    except Exception as e:
+                        logger.error(f"Error notifying UI {ui_sid}: {e}")
+
+                # Clean up session
+                for ui_sid in session.ui_sids:
+                    ui_sid_to_session.pop(ui_sid, None)
+                del sessions[session_id]
+            return
 
     # Check if this was a UI client
     if sid in ui_sid_to_session:
@@ -630,147 +666,186 @@ async def handle_enable_remote_control_response(sid: str, data: Dict = None):
 @sio.on('laser_scan')
 async def handle_laser_scan(sid: str, data: Dict):
     """Receive LiDAR scan data from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
 
-    session.sensor_data['laser_scan'] = data
+        session.sensor_data['laser_scan'] = data
 
-    # Forward to robot app for object detection
-    if session.robot_app:
-        session.robot_app.robot.get_transport().inject_message(data)
+        # Forward to robot app for object detection
+        if session.robot_app:
+            session.robot_app.robot.get_transport().inject_message(data)
 
-    await broadcast_to_ui(session.session_id, 'laser_scan', data)
+        await broadcast_to_ui(session.session_id, 'laser_scan', data)
+    except Exception as e:
+        logger.error(f"Error handling laser_scan: {e}")
 
 
 @sio.on('robot_pose')
 async def handle_robot_pose(sid: str, data: Dict):
     """Receive robot pose from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
 
-    session.sensor_data['pose'] = data
+        session.sensor_data['pose'] = data
 
-    if session.robot_app:
-        session.robot_app.robot.get_transport().inject_message(data)
+        if session.robot_app:
+            session.robot_app.robot.get_transport().inject_message(data)
 
-    await broadcast_to_ui(session.session_id, 'robot_pose', data)
+        await broadcast_to_ui(session.session_id, 'robot_pose', data)
+    except Exception as e:
+        logger.error(f"Error handling robot_pose: {e}")
 
 
 @sio.on('battery')
 async def handle_battery(sid: str, data: Dict):
     """Receive battery data from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
 
-    session.sensor_data['battery'] = data
+        session.sensor_data['battery'] = data
 
-    if session.robot_app:
-        session.robot_app.robot.get_transport().inject_message(data)
+        if session.robot_app:
+            session.robot_app.robot.get_transport().inject_message(data)
 
-    await broadcast_to_ui(session.session_id, 'battery', data)
+        await broadcast_to_ui(session.session_id, 'battery', data)
+    except Exception as e:
+        logger.error(f"Error handling battery: {e}")
 
 
 @sio.on('map')
 async def handle_map(sid: str, data: Dict):
     """Receive map data from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
 
-    session.sensor_data['map'] = data
+        session.sensor_data['map'] = data
 
-    if session.robot_app:
-        session.robot_app.robot.get_transport().inject_message(data)
+        if session.robot_app:
+            session.robot_app.robot.get_transport().inject_message(data)
 
-    await broadcast_to_ui(session.session_id, 'map', data)
+        await broadcast_to_ui(session.session_id, 'map', data)
+    except Exception as e:
+        logger.error(f"Error handling map: {e}")
 
 
 @sio.on('camera')
 async def handle_camera(sid: str, data: Dict):
     """Receive camera frame from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
 
-    session.sensor_data['camera'] = data
-    await broadcast_to_ui(session.session_id, 'camera', data)
+        session.sensor_data['camera'] = data
+        await broadcast_to_ui(session.session_id, 'camera', data)
+    except Exception as e:
+        logger.error(f"Error handling camera: {e}")
 
 
 @sio.on('navigation_status')
 async def handle_navigation_status(sid: str, data: Dict):
     """Receive navigation status from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'navigation_status', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'navigation_status', data)
+    except Exception as e:
+        logger.error(f"Error handling navigation_status: {e}")
 
 
 @sio.on('navigation_feedback')
 async def handle_navigation_feedback(sid: str, data: Dict):
     """Receive navigation feedback from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'navigation_feedback', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'navigation_feedback', data)
+    except Exception as e:
+        logger.error(f"Error handling navigation_feedback: {e}")
 
 
 @sio.on('wifi')
 async def handle_wifi(sid: str, data: Dict):
     """Receive WiFi signal data from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
 
-    session.sensor_data['wifi'] = data
-    await broadcast_to_ui(session.session_id, 'wifi', data)
+        session.sensor_data['wifi'] = data
+        await broadcast_to_ui(session.session_id, 'wifi', data)
+    except Exception as e:
+        logger.error(f"Error handling wifi: {e}")
 
 
 @sio.on('cmd_vel')
 async def handle_cmd_vel(sid: str, data: Dict):
     """Receive current velocity from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'cmd_vel', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'cmd_vel', data)
+    except Exception as e:
+        logger.error(f"Error handling cmd_vel: {e}")
 
 
 @sio.on('robot_spec')
 async def handle_robot_spec(sid: str, data: Dict):
     """Receive robot specification from robot"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'robot_spec', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'robot_spec', data)
+    except Exception as e:
+        logger.error(f"Error handling robot_spec: {e}")
 
 
 @sio.on('robot_specification')
 async def handle_robot_specification(sid: str, data: Dict):
     """Receive robot specification (alternate event name)"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'robot_specification', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'robot_specification', data)
+    except Exception as e:
+        logger.error(f"Error handling robot_specification: {e}")
 
 
 @sio.on('object_detection')
 async def handle_object_detection(sid: str, data: Dict):
     """Receive object detection results"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'object_detection', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'object_detection', data)
+    except Exception as e:
+        logger.error(f"Error handling object_detection: {e}")
 
 
 @sio.on('console')
 async def handle_console(sid: str, data: Dict):
     """Receive console output"""
-    session = _get_session_for_robot(sid)
-    if not session:
-        return
-    await broadcast_to_ui(session.session_id, 'console', data)
+    try:
+        session = _get_session_for_robot(sid)
+        if not session:
+            return
+        await broadcast_to_ui(session.session_id, 'console', data)
+    except Exception as e:
+        logger.error(f"Error handling console: {e}")
 
 
 # ============================================================================
@@ -914,6 +989,23 @@ async def handle_navigate_to_pose(sid: str, data: Dict):
 
     session = sessions.get(session_id)
     if not session or not session.robot_sid:
+        return
+
+    # Validate navigation command bounds
+    MAX_POSITION = 50.0  # meters
+    MAX_ANGLE = 2 * math.pi  # radians
+
+    pose = data.get('pose', data)  # pose may be nested or top-level
+    x = pose.get('x', 0.0)
+    y = pose.get('y', 0.0)
+    yaw = pose.get('yaw', pose.get('theta', 0.0))
+
+    if abs(x) > MAX_POSITION or abs(y) > MAX_POSITION:
+        logger.warning(f"[Navigation] Out of bounds: x={x}, y={y} (max +/-{MAX_POSITION}m)")
+        return
+
+    if abs(yaw) > MAX_ANGLE:
+        logger.warning(f"[Navigation] Angle out of bounds: yaw={yaw} (max +/-{MAX_ANGLE} rad)")
         return
 
     await sio.emit('navigate_to_pose', data, room=session.robot_sid)
