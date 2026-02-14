@@ -143,6 +143,8 @@ class Session:
     robot_app: Optional[MyRobotApp] = None
     sensor_data: dict = field(default_factory=dict)
     connected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    created_timestamp: float = field(default_factory=time.time)
+    last_heartbeat: float = field(default_factory=time.time)
     phase_timeout_task: Optional[asyncio.Task] = None
 
     def is_active(self) -> bool:
@@ -177,10 +179,13 @@ def generate_app_signature(session_id: str, timestamp: str) -> str:
 
 
 def _get_session_for_robot(sid: str) -> Optional[Session]:
-    """Get session for a robot SID via reverse lookup."""
+    """Get session for a robot SID via reverse lookup. Updates heartbeat."""
     session_id = robot_sid_to_session.get(sid)
     if session_id:
-        return sessions.get(session_id)
+        session = sessions.get(session_id)
+        if session:
+            session.last_heartbeat = time.time()
+        return session
     return None
 
 
@@ -213,6 +218,37 @@ async def _phase_timeout(session_id: str, phase: str, timeout: int) -> None:
             await sio.disconnect(session.robot_sid)
         except Exception as e:
             logger.error(f"[Timeout] Error disconnecting robot: {e}")
+
+
+async def cleanup_stale_sessions() -> None:
+    """Background task: remove stale sessions every 60 seconds."""
+    while True:
+        await asyncio.sleep(60)
+        now = time.time()
+        stale = []
+        for session_id, session in list(sessions.items()):
+            if session.state in (SessionState.DISCONNECTED, SessionState.TIMEOUT, SessionState.ERROR):
+                if now - session.last_heartbeat > 300:  # 5 min since last activity
+                    stale.append(session_id)
+            elif session.state == SessionState.ACTIVE:
+                if now - session.last_heartbeat > Config.HEARTBEAT_TIMEOUT:
+                    logger.warning(f"[Cleanup] Session {session_id} heartbeat stale")
+                    session.state = SessionState.TIMEOUT
+
+        for session_id in stale:
+            session = sessions.pop(session_id, None)
+            if session:
+                session.cancel_timeout()
+                if session.robot_app:
+                    try:
+                        session.robot_app.stop()
+                    except Exception:
+                        pass
+                for ui_sid in session.ui_sids:
+                    ui_sid_to_session.pop(ui_sid, None)
+                if session.robot_sid:
+                    robot_sid_to_session.pop(session.robot_sid, None)
+                logger.info(f"[Cleanup] Removed stale session {session_id}")
 
 
 async def broadcast_to_ui(session_id: str, event: str, data: Dict) -> None:
@@ -576,6 +612,7 @@ async def handle_enable_remote_control_response(sid: str, data: Dict = None):
 
     if status == 'enabled':
         session.state = SessionState.ACTIVE
+        session.last_heartbeat = time.time()
 
         # Emit robot_ready to ALL UI clients
         await broadcast_to_ui(session_id, 'robot_ready', {
@@ -1039,6 +1076,34 @@ if static_path.exists():
         if path == "" or not (static_path / path).exists():
             return FileResponse(static_path / "index.html")
         return FileResponse(static_path / path)
+
+
+# ============================================================================
+# Startup / Shutdown
+# ============================================================================
+
+_cleanup_task: Optional[asyncio.Task] = None
+
+
+@app.on_event("startup")
+async def on_startup():
+    """Start background tasks."""
+    global _cleanup_task
+    _cleanup_task = asyncio.create_task(cleanup_stale_sessions())
+    logger.info("[Startup] Stale session cleanup task started (every 60s)")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Cancel background tasks on shutdown."""
+    global _cleanup_task
+    if _cleanup_task and not _cleanup_task.done():
+        _cleanup_task.cancel()
+        try:
+            await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+    logger.info("[Shutdown] Cleanup task cancelled")
 
 
 # ============================================================================
