@@ -23,6 +23,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional
@@ -66,6 +67,11 @@ class Config:
 
     # Session
     SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))
+
+    # Protocol timeouts
+    PHASE_1_TIMEOUT = int(os.getenv("PHASE_1_TIMEOUT", "30"))
+    PHASE_2_TIMEOUT = int(os.getenv("PHASE_2_TIMEOUT", "60"))
+    HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT", "60"))
 
 
 # ============================================================================
@@ -137,9 +143,16 @@ class Session:
     robot_app: Optional[MyRobotApp] = None
     sensor_data: dict = field(default_factory=dict)
     connected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    phase_timeout_task: Optional[asyncio.Task] = None
 
     def is_active(self) -> bool:
         return self.state == SessionState.ACTIVE and self.robot_sid is not None
+
+    def cancel_timeout(self) -> None:
+        """Cancel any pending phase timeout task."""
+        if self.phase_timeout_task and not self.phase_timeout_task.done():
+            self.phase_timeout_task.cancel()
+            self.phase_timeout_task = None
 
 
 # Module-level lookup maps
@@ -169,6 +182,37 @@ def _get_session_for_robot(sid: str) -> Optional[Session]:
     if session_id:
         return sessions.get(session_id)
     return None
+
+
+async def _phase_timeout(session_id: str, phase: str, timeout: int) -> None:
+    """Timeout handler for protocol phases. Disconnects robot on timeout."""
+    try:
+        await asyncio.sleep(timeout)
+    except asyncio.CancelledError:
+        return  # Phase completed normally, timeout cancelled
+
+    session = sessions.get(session_id)
+    if not session:
+        return
+    if session.state in (SessionState.ACTIVE, SessionState.DISCONNECTED, SessionState.TIMEOUT):
+        return  # Already completed, disconnected, or timed out
+
+    logger.warning(f"[Timeout] Phase {phase} timed out after {timeout}s for session {session_id}")
+    session.state = SessionState.TIMEOUT
+
+    # Notify UI clients
+    await broadcast_to_ui(session_id, 'phase_timeout', {
+        'session_id': session_id,
+        'phase': phase,
+        'timeout': timeout
+    })
+
+    # Disconnect robot only if still connected
+    if session.robot_sid:
+        try:
+            await sio.disconnect(session.robot_sid)
+        except Exception as e:
+            logger.error(f"[Timeout] Error disconnecting robot: {e}")
 
 
 async def broadcast_to_ui(session_id: str, event: str, data: Dict) -> None:
@@ -323,6 +367,7 @@ async def handle_disconnect(sid: str):
 
         if session:
             logger.info(f"[Robot] Disconnected: session={session_id}")
+            session.cancel_timeout()
             session.state = SessionState.DISCONNECTED
 
             # Stop robot app
@@ -395,6 +440,12 @@ async def handle_start_protocol(sid: str, data: Dict = None):
 
     logger.info(f"[Phase 1] Sent app_signature for session {session_id}")
 
+    # Schedule Phase 1 timeout
+    session.cancel_timeout()
+    session.phase_timeout_task = asyncio.create_task(
+        _phase_timeout(session_id, 'phase1', Config.PHASE_1_TIMEOUT)
+    )
+
 
 @sio.on('signature_verified')
 async def handle_signature_verified(sid: str, data: Dict = None):
@@ -416,6 +467,9 @@ async def handle_signature_verified(sid: str, data: Dict = None):
 
     verified = data.get('verified', True) if data else True
 
+    # Cancel Phase 1 timeout
+    session.cancel_timeout()
+
     if not verified:
         logger.error(f"[Phase 1] Signature verification FAILED for session {session_id}")
         session.state = SessionState.ERROR
@@ -429,6 +483,11 @@ async def handle_signature_verified(sid: str, data: Dict = None):
     await sio.emit('setup_app_cmd', {
         'session_id': session_id
     }, room=sid)
+
+    # Schedule Phase 2 timeout
+    session.phase_timeout_task = asyncio.create_task(
+        _phase_timeout(session_id, 'phase2', Config.PHASE_2_TIMEOUT)
+    )
 
 
 @sio.on('setup_app_response')
@@ -451,6 +510,9 @@ async def handle_setup_app_response(sid: str, data: Dict = None):
 
     status = data.get('status') if data else 'success'
     logger.info(f"[Phase 2] Setup response: session={session_id}, status={status}")
+
+    # Cancel Phase 2 timeout
+    session.cancel_timeout()
 
     if status != 'success':
         logger.error(f"[Phase 2] Setup failed: {data.get('message') if data else 'unknown'}")
@@ -476,6 +538,11 @@ async def handle_setup_app_response(sid: str, data: Dict = None):
         robot_app.start()
 
         logger.info(f"[Phase 2] Setup complete, MyRobotApp started for session {session_id}")
+
+        # Schedule Phase 3 timeout
+        session.phase_timeout_task = asyncio.create_task(
+            _phase_timeout(session_id, 'phase3', Config.HEARTBEAT_TIMEOUT)
+        )
 
         # Notify UI
         await broadcast_to_ui(session_id, 'setup_complete', {
@@ -503,6 +570,9 @@ async def handle_enable_remote_control_response(sid: str, data: Dict = None):
 
     status = data.get('status') if data else 'enabled'
     logger.info(f"[Phase 3] Remote control response: session={session_id}, status={status}")
+
+    # Cancel Phase 3 timeout
+    session.cancel_timeout()
 
     if status == 'enabled':
         session.state = SessionState.ACTIVE
