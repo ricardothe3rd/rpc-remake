@@ -1087,8 +1087,16 @@ _cleanup_task: Optional[asyncio.Task] = None
 
 @app.on_event("startup")
 async def on_startup():
-    """Start background tasks."""
+    """Validate config and start background tasks."""
     global _cleanup_task
+
+    # APP_SECRET validation
+    if Config.APP_SECRET == "your-app-secret-key-here":
+        logger.warning("[SECURITY] APP_SECRET is using default value! Set a real secret in production.")
+    elif len(Config.APP_SECRET) < 32:
+        logger.warning("[SECURITY] APP_SECRET is less than 32 characters! Minimum 32 required.")
+
+    # Start stale session cleanup
     _cleanup_task = asyncio.create_task(cleanup_stale_sessions())
     logger.info("[Startup] Stale session cleanup task started (every 60s)")
 
