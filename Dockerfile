@@ -64,9 +64,9 @@ USER appuser
 # Expose port (dynamic via environment variable)
 EXPOSE 8080
 
-# Health check
+# Health check — Traefik checks /health
 HEALTHCHECK --interval=10s --timeout=3s --start-period=30s \
-    CMD curl -f http://localhost:${PORT:-8080}/api/health || exit 1
+    CMD curl -f http://localhost:${PORT:-8080}/health || exit 1
 
 # Start server
 # Note: PORT is set by Remake Platform, defaults to 8080
