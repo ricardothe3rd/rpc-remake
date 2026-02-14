@@ -323,6 +323,7 @@ async def handle_disconnect(sid: str):
 
         if session:
             logger.info(f"[Robot] Disconnected: session={session_id}")
+            session.state = SessionState.DISCONNECTED
 
             # Stop robot app
             if session.robot_app:
@@ -409,10 +410,15 @@ async def handle_signature_verified(sid: str, data: Dict = None):
     if not session:
         return
 
+    if session.state != SessionState.PHASE_1_CONNECTING:
+        logger.warning(f"[Phase 1] Unexpected signature_verified in state {session.state}")
+        return
+
     verified = data.get('verified', True) if data else True
 
     if not verified:
         logger.error(f"[Phase 1] Signature verification FAILED for session {session_id}")
+        session.state = SessionState.ERROR
         await sio.disconnect(sid)
         return
 
@@ -439,11 +445,16 @@ async def handle_setup_app_response(sid: str, data: Dict = None):
     if not session:
         return
 
+    if session.state != SessionState.PHASE_2_SETTING_UP:
+        logger.warning(f"[Phase 2] Unexpected setup_app_response in state {session.state}")
+        return
+
     status = data.get('status') if data else 'success'
     logger.info(f"[Phase 2] Setup response: session={session_id}, status={status}")
 
     if status != 'success':
         logger.error(f"[Phase 2] Setup failed: {data.get('message') if data else 'unknown'}")
+        session.state = SessionState.ERROR
         return
 
     try:
@@ -473,6 +484,7 @@ async def handle_setup_app_response(sid: str, data: Dict = None):
 
     except Exception as e:
         logger.error(f"[Phase 2] Error during setup: {e}")
+        session.state = SessionState.ERROR
 
 
 @sio.on('enable_remote_control_response')
