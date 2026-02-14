@@ -181,9 +181,9 @@ const App: React.FC = () => {
   // Read URL parameters (passed from AppStore)
   const params = new URLSearchParams(window.location.search)
   const sessionId = params.get('session_id')
-  const robotId = params.get('robot_id')
-  const token = params.get('token')
-  const apiUrl = params.get('api_url') || 'http://localhost:5000'
+  const robotId = params.get('robot_id')  // Optional, for display only
+  const token = params.get('token')        // Optional, for display only
+  const apiUrl = params.get('api_url') || window.location.origin
 
   const [robotConnected, setRobotConnected] = useState(false)
   const [batteryData, setBatteryData] = useState<BatteryData | null>(null)
@@ -241,27 +241,47 @@ const App: React.FC = () => {
   }
 
   const connectWebSocket = useCallback(() => {
-    // Check if URL parameters are present
-    if (!sessionId || !robotId || !token) {
-      setConnectionError('Missing required URL parameters (session_id, robot_id, token)')
-      console.error('Missing URL parameters:', { sessionId, robotId, token, apiUrl })
+    if (!sessionId) {
+      setConnectionError('Missing required URL parameter: session_id')
+      console.error('Missing session_id URL parameter')
       return
     }
 
-    console.log('Connecting to AppStore WebSocket:', { apiUrl, sessionId, robotId })
+    console.log('Connecting to app backend (same-origin):', { sessionId })
 
-    // Connect to AppStore WebSocket (not RPC backend)
-    const newSocket = io(`${apiUrl}/sessions/${sessionId}/robot`, {
-      auth: { token, robot_id: robotId }
+    // Connect to same-origin root namespace (APP_ROBOT_PROTOCOL v1.0)
+    const newSocket = io('/', {
+      transports: ['websocket', 'polling']
     })
 
     newSocket.on('connect', () => {
-      console.log('Connected to AppStore WebSocket')
+      console.log('Connected to app backend')
       setSocket(newSocket)
       setConnectionError(null)
+
+      // Register with session (protocol requirement)
+      newSocket.emit('join_session', { session_id: sessionId })
     })
 
-    // Set up event handlers for robot data
+    // Protocol events
+    newSocket.on('robot_ready', (data) => {
+      console.log('Robot ready:', data)
+      setRobotConnected(true)
+    })
+
+    newSocket.on('robot_disconnected', (data) => {
+      console.log('Robot disconnected:', data)
+      setRobotConnected(false)
+    })
+
+    newSocket.on('session_state', (data) => {
+      console.log('Session state:', data)
+      if (data.state === 'active') {
+        setRobotConnected(true)
+      }
+    })
+
+    // Sensor data handlers
     newSocket.on('battery', (data) => {
       updateLastDataTimestamp(data.timestamp)
       setBatteryData(data)
@@ -336,11 +356,6 @@ const App: React.FC = () => {
       })
     })
 
-    newSocket.on('connected', () => {
-      console.log('Robot connected')
-      setRobotConnected(true)
-    })
-
     newSocket.on('disconnect', () => {
       console.log('Socket disconnected')
       setRobotConnected(false)
@@ -358,7 +373,7 @@ const App: React.FC = () => {
     })
 
     return newSocket
-  }, [sessionId, robotId, token, apiUrl, updateLastDataTimestamp])
+  }, [sessionId, updateLastDataTimestamp])
 
   useEffect(() => {
     const newSocket = connectWebSocket()
@@ -369,39 +384,8 @@ const App: React.FC = () => {
     }
   }, [connectWebSocket])
 
-  // Initialize chat session with RPC backend
-  useEffect(() => {
-    if (!sessionId || !token || !apiUrl) {
-      console.log('Skipping init-session: missing params')
-      return
-    }
-
-    const initSession = async () => {
-      try {
-        console.log('Initializing chat session with RPC backend...')
-        const response = await fetch(`${window.location.origin}/api/init-session`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            session_id: sessionId,
-            session_token: token,
-            appstore_url: apiUrl,
-          }),
-        })
-        const data = await response.json()
-        console.log('Init session response:', data)
-      } catch (error) {
-        console.error('Failed to initialize chat session:', error)
-      }
-    }
-
-    initSession()
-  }, [sessionId, token, apiUrl])
-
-  // Robot status is now managed via Socket.IO events (connected/disconnect)
-  // No need to poll the API anymore
+  // Robot status managed via Socket.IO events (robot_ready / robot_disconnected)
+  // Chat session initialized automatically when robot completes three-phase protocol
 
   // Object detection data is now received via Socket.IO events
   // No need to poll the API anymore

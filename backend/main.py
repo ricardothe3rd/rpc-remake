@@ -1,24 +1,21 @@
 """
 Remake RPC - Robot Control Application
 ========================================
-FastAPI + Socket.IO server combining RPC_v2 functionality with three-phase protocol.
+FastAPI + Socket.IO server implementing the Remake Platform App Robot Protocol.
 
-This app implements:
-- Three-phase connection protocol for Appstore integration
-- Object detection (RANSAC V4 + ML)
-- Chat interface via AppstoreBridge
-- Full React UI with sensor visualization
+Protocol Flow:
+    1. Robot connects with auth={type:'robot', session_id, session_token}
+    2. Robot emits start_protocol
+    3. App emits app_signature → Robot responds signature_verified
+    4. App emits setup_app_cmd → Robot responds setup_app_response
+    5. Robot sends enable_remote_control_response → App emits robot_ready to UI
 
 Architecture:
-    Robot ←Socket.IO→ App Backend ←Socket.IO→ Frontend UI
-                      (this file)
-
-WebSocket Namespaces:
-    /sessions/{sessionId}/robot - Robot connection (dynamic namespace)
-    / - Frontend UI connection
+    Robot ←Socket.IO (root /)→ App Backend ←Socket.IO (root /)→ Frontend UI
 
 Author: Remake AI
-Version: 1.0.0
+Version: 2.0.0
+Protocol: APP_ROBOT_PROTOCOL v1.0
 """
 
 import os
@@ -26,22 +23,19 @@ import asyncio
 import hashlib
 import hmac
 import logging
-from typing import Dict, Optional, Set
+from dataclasses import dataclass, field
+from typing import Dict, Optional
 from datetime import datetime
 from pathlib import Path
 
 import socketio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 import uvicorn
 
 from my_robot_app import MyRobotApp
-from robot_proxy import RobotProxy
-from ui_proxy import UIProxy
-from websocket_wrapper import WebSocketWrapper
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -59,7 +53,7 @@ class Config:
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8080"))
 
-    # Security (REQUIRED - set in production!)
+    # Security
     APP_SECRET = os.getenv("APP_SECRET", "your-app-secret-key-here")
     APP_ID = os.getenv("APP_ID", "remake-rpc-001")
 
@@ -70,7 +64,7 @@ class Config:
     ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
     # Session
-    SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))  # 1 hour
+    SESSION_TIMEOUT = int(os.getenv("SESSION_TIMEOUT", "3600"))
 
 
 # ============================================================================
@@ -80,13 +74,12 @@ class Config:
 app = FastAPI(
     title="Remake RPC",
     description="Robot control application with object detection and chat",
-    version="1.0.0"
+    version="2.0.0"
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,18 +87,18 @@ app.add_middleware(
 
 
 # ============================================================================
-# Socket.IO Server
+# Socket.IO Server (Root Namespace Only)
 # ============================================================================
 
-# Create Socket.IO server with CORS
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins="*",
     logger=True,
-    engineio_logger=False
+    engineio_logger=False,
+    ping_timeout=60,
+    ping_interval=25
 )
 
-# Wrap with ASGI app
 socket_app = socketio.ASGIApp(
     socketio_server=sio,
     other_asgi_app=app,
@@ -114,87 +107,29 @@ socket_app = socketio.ASGIApp(
 
 
 # ============================================================================
-# Session State Management
+# Session Model
 # ============================================================================
 
-class SessionState:
-    """Tracks state for active robot sessions"""
+@dataclass
+class Session:
+    """Represents an active robot-app session"""
+    session_id: str
+    robot_sid: Optional[str] = None
+    ui_sids: list = field(default_factory=list)
+    state: str = 'waiting'  # waiting -> protocol_started -> setup_complete -> active
+    session_token: Optional[str] = None
+    robot_app: Optional[MyRobotApp] = None
+    sensor_data: dict = field(default_factory=dict)
+    connected_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
-    def __init__(self):
-        self.sessions: Dict[str, Dict] = {}  # session_id -> session data
-        self.robot_sids: Dict[str, str] = {}  # session_id -> robot socket_id
-        self.ui_clients: Dict[str, Set[str]] = {}  # session_id -> set of ui socket_ids
-        self.robot_apps: Dict[str, MyRobotApp] = {}  # session_id -> MyRobotApp instance
-
-    def create_session(self, session_id: str, robot_sid: str) -> None:
-        """Create new session when robot connects"""
-        self.sessions[session_id] = {
-            'session_id': session_id,
-            'robot_sid': robot_sid,
-            'connected_at': datetime.utcnow().isoformat(),
-            'phase': 1,  # Phase 1: establishing
-            'setup_complete': False,
-            'remote_control_enabled': False,
-            'sensor_data': {},
-            'session_token': None,  # Will be set during setup
-        }
-        self.robot_sids[session_id] = robot_sid
-        self.ui_clients[session_id] = set()
-        logger.info(f"[Session] Created session {session_id}")
-
-    def add_ui_client(self, session_id: str, ui_sid: str) -> None:
-        """Add UI client to session"""
-        if session_id in self.ui_clients:
-            self.ui_clients[session_id].add(ui_sid)
-            logger.info(f"[Session] Added UI client {ui_sid} to session {session_id}")
-
-    def remove_ui_client(self, session_id: str, ui_sid: str) -> None:
-        """Remove UI client from session"""
-        if session_id in self.ui_clients and ui_sid in self.ui_clients[session_id]:
-            self.ui_clients[session_id].remove(ui_sid)
-            logger.info(f"[Session] Removed UI client {ui_sid} from session {session_id}")
-
-    def end_session(self, session_id: str) -> None:
-        """Clean up session"""
-        # Stop robot app if exists
-        if session_id in self.robot_apps:
-            try:
-                self.robot_apps[session_id].stop()
-            except Exception as e:
-                logger.error(f"Error stopping robot app: {e}")
-            del self.robot_apps[session_id]
-
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-        if session_id in self.robot_sids:
-            del self.robot_sids[session_id]
-        if session_id in self.ui_clients:
-            del self.ui_clients[session_id]
-        logger.info(f"[Session] Ended session {session_id}")
-
-    def get_session(self, session_id: str) -> Optional[Dict]:
-        """Get session data"""
-        return self.sessions.get(session_id)
-
-    def get_robot_sid(self, session_id: str) -> Optional[str]:
-        """Get robot socket ID for session"""
-        return self.robot_sids.get(session_id)
-
-    def get_ui_clients(self, session_id: str) -> Set[str]:
-        """Get all UI client socket IDs for session"""
-        return self.ui_clients.get(session_id, set())
-
-    def get_robot_app(self, session_id: str) -> Optional[MyRobotApp]:
-        """Get robot app instance for session"""
-        return self.robot_apps.get(session_id)
-
-    def set_robot_app(self, session_id: str, robot_app: MyRobotApp) -> None:
-        """Store robot app instance for session"""
-        self.robot_apps[session_id] = robot_app
+    def is_active(self) -> bool:
+        return self.state == 'active' and self.robot_sid is not None
 
 
-# Global session state
-session_state = SessionState()
+# Module-level lookup maps
+sessions: Dict[str, Session] = {}
+robot_sid_to_session: Dict[str, str] = {}
+ui_sid_to_session: Dict[str, str] = {}
 
 
 # ============================================================================
@@ -202,16 +137,7 @@ session_state = SessionState()
 # ============================================================================
 
 def generate_app_signature(session_id: str, timestamp: str) -> str:
-    """
-    Generate HMAC-SHA256 signature for robot authentication.
-
-    Args:
-        session_id: Unique session identifier
-        timestamp: ISO 8601 timestamp
-
-    Returns:
-        Hex-encoded HMAC signature
-    """
+    """Generate HMAC-SHA256 signature for robot authentication."""
     message = f"{Config.APP_ID}:{session_id}:{timestamp}"
     signature = hmac.new(
         Config.APP_SECRET.encode('utf-8'),
@@ -221,270 +147,24 @@ def generate_app_signature(session_id: str, timestamp: str) -> str:
     return signature
 
 
-async def broadcast_to_ui(session_id: str, event: str, data: Dict) -> None:
-    """
-    Broadcast event to all UI clients connected to a session.
+def _get_session_for_robot(sid: str) -> Optional[Session]:
+    """Get session for a robot SID via reverse lookup."""
+    session_id = robot_sid_to_session.get(sid)
+    if session_id:
+        return sessions.get(session_id)
+    return None
 
-    Args:
-        session_id: Session identifier
-        event: Event name
-        data: Event payload
-    """
-    ui_clients = session_state.get_ui_clients(session_id)
-    for ui_sid in ui_clients:
+
+async def broadcast_to_ui(session_id: str, event: str, data: Dict) -> None:
+    """Broadcast event to all UI clients connected to a session."""
+    session = sessions.get(session_id)
+    if not session:
+        return
+    for ui_sid in session.ui_sids:
         try:
             await sio.emit(event, data, room=ui_sid)
         except Exception as e:
             logger.error(f"[UI Broadcast] Error sending to {ui_sid}: {e}")
-
-
-# ============================================================================
-# Dynamic Namespace Handler for Robot Connections
-# ============================================================================
-
-class RobotNamespace(socketio.AsyncNamespace):
-    """
-    Dynamic namespace handler for robot connections.
-    Handles pattern: /sessions/{sessionId}/robot
-    """
-
-    def __init__(self, namespace_pattern: str):
-        super().__init__(namespace_pattern)
-        self.namespace_pattern = namespace_pattern
-
-    async def on_connect(self, sid: str, environ: Dict):
-        """
-        Robot connected to session namespace.
-
-        Phase 1: Send app signature for platform verification.
-        """
-        # Extract session_id from namespace
-        namespace = environ.get('asgi.scope', {}).get('path', '').replace('/socket.io/', '')
-        session_id = self._extract_session_id(namespace)
-
-        if not session_id:
-            logger.error(f"[Robot] Invalid namespace: {namespace}")
-            return False
-
-        logger.info(f"[Robot] Connected: sid={sid}, session={session_id}")
-
-        # Create session
-        session_state.create_session(session_id, sid)
-
-        # Phase 1: Send signature for verification
-        timestamp = datetime.utcnow().isoformat()
-        signature = generate_app_signature(session_id, timestamp)
-
-        await self.emit('app_signature', {
-            'app_signature': signature,
-            'timestamp': timestamp,
-            'app_id': Config.APP_ID
-        }, room=sid)
-
-        logger.info(f"[Phase 1] Sent signature for session {session_id}")
-        return True
-
-    async def on_disconnect(self, sid: str):
-        """Robot disconnected"""
-        # Find session by robot sid
-        session_id = None
-        for sess_id, robot_sid in session_state.robot_sids.items():
-            if robot_sid == sid:
-                session_id = sess_id
-                break
-
-        if session_id:
-            logger.info(f"[Robot] Disconnected: session={session_id}")
-
-            # Notify UI clients
-            await broadcast_to_ui(session_id, 'robot_disconnected', {
-                'session_id': session_id,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-
-            # Clean up session
-            session_state.end_session(session_id)
-
-    async def on_setup_app_cmd(self, sid: str, data: Dict):
-        """
-        Phase 2: Handle setup command from robot.
-
-        This is where we instantiate MyRobotApp with the robot connection.
-        """
-        session_id = data.get('session_id')
-        session_token = data.get('session_token')  # From platform
-        logger.info(f"[Phase 2] Setup command received for session {session_id}")
-
-        session = session_state.get_session(session_id)
-        if not session:
-            logger.error(f"[Phase 2] Session not found: {session_id}")
-            return
-
-        # Update session state
-        session['phase'] = 2
-        session['session_token'] = session_token
-
-        try:
-            # Create WebSocketWrapper for robot communication
-            # This wraps the Socket.IO connection to look like a WebSocket
-            robot_transport = SocketIOWrapper(sio, sid, f'/sessions/{session_id}/robot')
-
-            # Create UI transport (will be used when UI clients connect)
-            ui_transport = SocketIOUIWrapper(sio, session_id)
-
-            # Instantiate MyRobotApp with the connected robot
-            robot_app = MyRobotApp(
-                robot_transport=robot_transport,
-                ui_transport=ui_transport,
-                session_id=session_id,
-                session_token=session_token,
-                appstore_url=Config.APPSTORE_URL
-            )
-
-            # Store the robot app instance
-            session_state.set_robot_app(session_id, robot_app)
-
-            # Start the robot app
-            robot_app.start()
-
-            # Mark setup complete
-            session['setup_complete'] = True
-            session['phase'] = 3
-
-            # Send success response to robot
-            await self.emit('setup_app_response', {
-                'session_id': session_id,
-                'status': 'success',
-                'message': 'App setup completed successfully'
-            }, room=sid)
-
-            logger.info(f"[Phase 2] Setup complete for session {session_id}, MyRobotApp started")
-
-            # Notify UI
-            await broadcast_to_ui(session_id, 'setup_complete', {
-                'session_id': session_id
-            })
-
-        except Exception as e:
-            logger.error(f"[Phase 2] Error during setup: {e}")
-            await self.emit('setup_app_response', {
-                'session_id': session_id,
-                'status': 'error',
-                'message': str(e)
-            }, room=sid)
-
-    async def on_enable_remote_control_response(self, sid: str, data: Dict):
-        """
-        Phase 3: Remote control enabled by robot.
-
-        Commands and sensor streaming now active.
-        """
-        session_id = data.get('session_id')
-        status = data.get('status')
-
-        logger.info(f"[Phase 3] Remote control response: session={session_id}, status={status}")
-
-        session = session_state.get_session(session_id)
-        if session:
-            session['remote_control_enabled'] = (status == 'enabled')
-
-            # Notify UI
-            await broadcast_to_ui(session_id, 'remote_control_status', {
-                'enabled': session['remote_control_enabled']
-            })
-
-    # ========================================================================
-    # Sensor Data Handlers (Robot → App → UI)
-    # ========================================================================
-
-    async def on_laser_scan(self, sid: str, data: Dict):
-        """Receive LiDAR scan data from robot"""
-        session_id = data.get('session_id')
-
-        # Update session state
-        session = session_state.get_session(session_id)
-        if session:
-            session['sensor_data']['laser_scan'] = data
-
-        # Forward to robot app for object detection
-        robot_app = session_state.get_robot_app(session_id)
-        if robot_app:
-            # Inject message into robot transport
-            robot_app.robot.get_transport().inject_message(data)
-
-        # Forward to UI clients
-        await broadcast_to_ui(session_id, 'laser_scan', data)
-
-    async def on_robot_pose(self, sid: str, data: Dict):
-        """Receive robot pose from robot"""
-        session_id = data.get('session_id')
-
-        session = session_state.get_session(session_id)
-        if session:
-            session['sensor_data']['pose'] = data
-
-        # Forward to robot app
-        robot_app = session_state.get_robot_app(session_id)
-        if robot_app:
-            robot_app.robot.get_transport().inject_message(data)
-
-        await broadcast_to_ui(session_id, 'robot_pose', data)
-
-    async def on_battery(self, sid: str, data: Dict):
-        """Receive battery data from robot"""
-        session_id = data.get('session_id')
-
-        session = session_state.get_session(session_id)
-        if session:
-            session['sensor_data']['battery'] = data
-
-        robot_app = session_state.get_robot_app(session_id)
-        if robot_app:
-            robot_app.robot.get_transport().inject_message(data)
-
-        await broadcast_to_ui(session_id, 'battery', data)
-
-    async def on_map(self, sid: str, data: Dict):
-        """Receive map data from robot"""
-        session_id = data.get('session_id')
-
-        session = session_state.get_session(session_id)
-        if session:
-            session['sensor_data']['map'] = data
-
-        robot_app = session_state.get_robot_app(session_id)
-        if robot_app:
-            robot_app.robot.get_transport().inject_message(data)
-
-        await broadcast_to_ui(session_id, 'map', data)
-
-    async def on_camera(self, sid: str, data: Dict):
-        """Receive camera frame from robot"""
-        session_id = data.get('session_id')
-
-        session = session_state.get_session(session_id)
-        if session:
-            session['sensor_data']['camera'] = data
-
-        await broadcast_to_ui(session_id, 'camera', data)
-
-    async def on_navigation_status(self, sid: str, data: Dict):
-        """Receive navigation status from robot"""
-        session_id = data.get('session_id')
-        await broadcast_to_ui(session_id, 'navigation_status', data)
-
-    async def on_navigation_feedback(self, sid: str, data: Dict):
-        """Receive navigation feedback from robot"""
-        session_id = data.get('session_id')
-        await broadcast_to_ui(session_id, 'navigation_feedback', data)
-
-    def _extract_session_id(self, namespace: str) -> Optional[str]:
-        """Extract session ID from namespace path"""
-        # Pattern: /sessions/{sessionId}/robot
-        parts = namespace.strip('/').split('/')
-        if len(parts) >= 2 and parts[0] == 'sessions':
-            return parts[1]
-        return None
 
 
 # ============================================================================
@@ -494,19 +174,19 @@ class RobotNamespace(socketio.AsyncNamespace):
 class SocketIOWrapper:
     """
     Wraps Socket.IO connection to look like WebSocketWrapper for MyRobotApp.
+    Emits on root namespace (no namespace parameter).
     """
 
-    def __init__(self, sio_server: socketio.AsyncServer, robot_sid: str, namespace: str):
+    def __init__(self, sio_server: socketio.AsyncServer, robot_sid: str):
         self.sio = sio_server
         self.robot_sid = robot_sid
-        self.namespace = namespace
         self.message_callbacks = []
         self._connected = True
 
     async def send_message(self, message: Dict) -> None:
-        """Send message to robot via Socket.IO"""
+        """Send message to robot via Socket.IO on root namespace"""
         event_type = message.get('type')
-        await self.sio.emit(event_type, message, room=self.robot_sid, namespace=self.namespace)
+        await self.sio.emit(event_type, message, room=self.robot_sid)
 
     def send_message_async(self, message: Dict) -> None:
         """Synchronous wrapper for send_message"""
@@ -524,21 +204,17 @@ class SocketIOWrapper:
                 logger.error(f"Error in message callback: {e}")
 
     def add_message_callback(self, callback: callable) -> None:
-        """Add message callback"""
         self.message_callbacks.append(callback)
 
     def remove_message_callback(self, callback: callable) -> None:
-        """Remove message callback"""
         if callback in self.message_callbacks:
             self.message_callbacks.remove(callback)
 
     def is_connected(self) -> bool:
-        """Check if connected"""
         return self._connected
 
     async def run_message_loop(self):
-        """Dummy message loop (handled by Socket.IO)"""
-        pass
+        pass  # Handled by Socket.IO
 
 
 class SocketIOUIWrapper:
@@ -557,7 +233,6 @@ class SocketIOUIWrapper:
         await broadcast_to_ui(self.session_id, event_type, message)
 
     def send_message_async(self, message: Dict) -> None:
-        """Synchronous wrapper for send_message"""
         asyncio.create_task(self.send_message(message))
 
     def inject_message(self, message: Dict) -> None:
@@ -572,141 +247,608 @@ class SocketIOUIWrapper:
                 logger.error(f"Error in UI callback: {e}")
 
     def add_message_callback(self, callback: callable) -> None:
-        """Add message callback"""
         self.message_callbacks.append(callback)
 
     def is_connected(self) -> bool:
-        """Always return True since UI clients can join anytime"""
-        return len(session_state.get_ui_clients(self.session_id)) > 0
-
-
-# Register robot namespace handler
-robot_ns = RobotNamespace('/sessions')
-sio.register_namespace(robot_ns)
+        session = sessions.get(self.session_id)
+        return session is not None and len(session.ui_sids) > 0
 
 
 # ============================================================================
-# UI WebSocket Handlers (Default Namespace)
+# Connection Handlers (Root Namespace)
 # ============================================================================
 
 @sio.on('connect')
-async def ui_connect(sid: str, environ: Dict):
-    """UI client connected"""
-    logger.info(f"[UI] Client connected: {sid}")
-    return True
+async def handle_connect(sid: str, environ: Dict, auth: Dict = None):
+    """
+    Unified connect handler for both robot and UI clients.
+    Robot: auth = {type: 'robot', session_id: ..., session_token: ...}
+    UI: no auth or auth without type='robot'
+    """
+    if auth and isinstance(auth, dict) and auth.get('type') == 'robot':
+        # --- Robot connection ---
+        session_id = auth.get('session_id')
+        session_token = auth.get('session_token')
+
+        if not session_id:
+            logger.error(f"[Robot] Connect rejected: no session_id in auth")
+            return False
+
+        logger.info(f"[Robot] Connected: sid={sid}, session={session_id}")
+
+        # Create or update session
+        if session_id not in sessions:
+            sessions[session_id] = Session(session_id=session_id)
+
+        session = sessions[session_id]
+        session.robot_sid = sid
+        session.session_token = session_token
+        session.state = 'waiting'
+
+        # Register reverse lookup
+        robot_sid_to_session[sid] = session_id
+
+        # DO NOT emit anything here — wait for start_protocol
+        return True
+    else:
+        # --- UI connection ---
+        logger.info(f"[UI] Client connected: {sid}")
+        return True
 
 
 @sio.on('disconnect')
-async def ui_disconnect(sid: str):
-    """UI client disconnected"""
-    logger.info(f"[UI] Client disconnected: {sid}")
+async def handle_disconnect(sid: str):
+    """Unified disconnect handler for robot and UI clients."""
 
-    # Remove from all sessions
-    for session_id in list(session_state.ui_clients.keys()):
-        session_state.remove_ui_client(session_id, sid)
+    # Check if this was a robot
+    if sid in robot_sid_to_session:
+        session_id = robot_sid_to_session.pop(sid)
+        session = sessions.get(session_id)
 
+        if session:
+            logger.info(f"[Robot] Disconnected: session={session_id}")
+
+            # Stop robot app
+            if session.robot_app:
+                try:
+                    session.robot_app.stop()
+                except Exception as e:
+                    logger.error(f"Error stopping robot app: {e}")
+
+            # Notify all UI clients
+            for ui_sid in session.ui_sids:
+                try:
+                    await sio.emit('robot_disconnected', {
+                        'session_id': session_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }, room=ui_sid)
+                except Exception as e:
+                    logger.error(f"Error notifying UI {ui_sid}: {e}")
+
+            # Clean up session
+            for ui_sid in session.ui_sids:
+                ui_sid_to_session.pop(ui_sid, None)
+            del sessions[session_id]
+        return
+
+    # Check if this was a UI client
+    if sid in ui_sid_to_session:
+        session_id = ui_sid_to_session.pop(sid)
+        session = sessions.get(session_id)
+        if session and sid in session.ui_sids:
+            session.ui_sids.remove(sid)
+            logger.info(f"[UI] Client {sid} left session {session_id}")
+        return
+
+    logger.info(f"[Socket] Unknown client disconnected: {sid}")
+
+
+# ============================================================================
+# Three-Phase Protocol Handlers
+# ============================================================================
+
+@sio.on('start_protocol')
+async def handle_start_protocol(sid: str, data: Dict = None):
+    """
+    Robot signals it's ready to receive events.
+    Phase 1: Generate and send app_signature.
+    """
+    session_id = robot_sid_to_session.get(sid)
+    if not session_id:
+        logger.error(f"[Protocol] start_protocol from unknown sid: {sid}")
+        return
+
+    session = sessions.get(session_id)
+    if not session:
+        return
+
+    logger.info(f"[Phase 1] Robot ready, sending app_signature for session {session_id}")
+    session.state = 'protocol_started'
+
+    # Generate and send HMAC signature
+    timestamp = datetime.utcnow().isoformat()
+    signature = generate_app_signature(session_id, timestamp)
+
+    await sio.emit('app_signature', {
+        'app_signature': signature,
+        'timestamp': timestamp,
+        'app_id': Config.APP_ID,
+        'session_id': session_id
+    }, room=sid)
+
+    logger.info(f"[Phase 1] Sent app_signature for session {session_id}")
+
+
+@sio.on('signature_verified')
+async def handle_signature_verified(sid: str, data: Dict = None):
+    """
+    Phase 1 complete: Robot verified our signature.
+    Phase 2 start: Send setup_app_cmd TO the robot.
+    """
+    session_id = robot_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session:
+        return
+
+    verified = data.get('verified', True) if data else True
+
+    if not verified:
+        logger.error(f"[Phase 1] Signature verification FAILED for session {session_id}")
+        await sio.disconnect(sid)
+        return
+
+    logger.info(f"[Phase 2] Signature verified, sending setup_app_cmd for session {session_id}")
+    session.state = 'signature_verified'
+
+    # App sends setup command TO the robot
+    await sio.emit('setup_app_cmd', {
+        'session_id': session_id
+    }, room=sid)
+
+
+@sio.on('setup_app_response')
+async def handle_setup_app_response(sid: str, data: Dict = None):
+    """
+    Phase 2 complete: Robot confirms setup.
+    Instantiate MyRobotApp with the robot connection.
+    """
+    session_id = robot_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session:
+        return
+
+    status = data.get('status') if data else 'success'
+    logger.info(f"[Phase 2] Setup response: session={session_id}, status={status}")
+
+    if status != 'success':
+        logger.error(f"[Phase 2] Setup failed: {data.get('message') if data else 'unknown'}")
+        return
+
+    try:
+        # Create transport wrappers (no namespace — root namespace)
+        robot_transport = SocketIOWrapper(sio, sid)
+        ui_transport = SocketIOUIWrapper(sio, session_id)
+
+        # Instantiate MyRobotApp
+        robot_app = MyRobotApp(
+            robot_transport=robot_transport,
+            ui_transport=ui_transport,
+            session_id=session_id,
+            session_token=session.session_token,
+            appstore_url=Config.APPSTORE_URL
+        )
+
+        session.robot_app = robot_app
+        session.state = 'setup_complete'
+        robot_app.start()
+
+        logger.info(f"[Phase 2] Setup complete, MyRobotApp started for session {session_id}")
+
+        # Notify UI
+        await broadcast_to_ui(session_id, 'setup_complete', {
+            'session_id': session_id
+        })
+
+    except Exception as e:
+        logger.error(f"[Phase 2] Error during setup: {e}")
+
+
+@sio.on('enable_remote_control_response')
+async def handle_enable_remote_control_response(sid: str, data: Dict = None):
+    """
+    Phase 3 complete: Robot confirms remote control is enabled.
+    Emit robot_ready to all UI clients in the session.
+    """
+    session_id = robot_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session:
+        return
+
+    status = data.get('status') if data else 'enabled'
+    logger.info(f"[Phase 3] Remote control response: session={session_id}, status={status}")
+
+    if status == 'enabled':
+        session.state = 'active'
+
+        # Emit robot_ready to ALL UI clients
+        await broadcast_to_ui(session_id, 'robot_ready', {
+            'session_id': session_id,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+
+        logger.info(f"[Phase 3] robot_ready emitted to {len(session.ui_sids)} UI clients")
+
+
+# ============================================================================
+# Sensor Data Handlers (Robot → App → UI)
+# ============================================================================
+
+@sio.on('laser_scan')
+async def handle_laser_scan(sid: str, data: Dict):
+    """Receive LiDAR scan data from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+
+    session.sensor_data['laser_scan'] = data
+
+    # Forward to robot app for object detection
+    if session.robot_app:
+        session.robot_app.robot.get_transport().inject_message(data)
+
+    await broadcast_to_ui(session.session_id, 'laser_scan', data)
+
+
+@sio.on('robot_pose')
+async def handle_robot_pose(sid: str, data: Dict):
+    """Receive robot pose from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+
+    session.sensor_data['pose'] = data
+
+    if session.robot_app:
+        session.robot_app.robot.get_transport().inject_message(data)
+
+    await broadcast_to_ui(session.session_id, 'robot_pose', data)
+
+
+@sio.on('battery')
+async def handle_battery(sid: str, data: Dict):
+    """Receive battery data from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+
+    session.sensor_data['battery'] = data
+
+    if session.robot_app:
+        session.robot_app.robot.get_transport().inject_message(data)
+
+    await broadcast_to_ui(session.session_id, 'battery', data)
+
+
+@sio.on('map')
+async def handle_map(sid: str, data: Dict):
+    """Receive map data from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+
+    session.sensor_data['map'] = data
+
+    if session.robot_app:
+        session.robot_app.robot.get_transport().inject_message(data)
+
+    await broadcast_to_ui(session.session_id, 'map', data)
+
+
+@sio.on('camera')
+async def handle_camera(sid: str, data: Dict):
+    """Receive camera frame from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+
+    session.sensor_data['camera'] = data
+    await broadcast_to_ui(session.session_id, 'camera', data)
+
+
+@sio.on('navigation_status')
+async def handle_navigation_status(sid: str, data: Dict):
+    """Receive navigation status from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'navigation_status', data)
+
+
+@sio.on('navigation_feedback')
+async def handle_navigation_feedback(sid: str, data: Dict):
+    """Receive navigation feedback from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'navigation_feedback', data)
+
+
+@sio.on('wifi')
+async def handle_wifi(sid: str, data: Dict):
+    """Receive WiFi signal data from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+
+    session.sensor_data['wifi'] = data
+    await broadcast_to_ui(session.session_id, 'wifi', data)
+
+
+@sio.on('cmd_vel')
+async def handle_cmd_vel(sid: str, data: Dict):
+    """Receive current velocity from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'cmd_vel', data)
+
+
+@sio.on('robot_spec')
+async def handle_robot_spec(sid: str, data: Dict):
+    """Receive robot specification from robot"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'robot_spec', data)
+
+
+@sio.on('robot_specification')
+async def handle_robot_specification(sid: str, data: Dict):
+    """Receive robot specification (alternate event name)"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'robot_specification', data)
+
+
+@sio.on('object_detection')
+async def handle_object_detection(sid: str, data: Dict):
+    """Receive object detection results"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'object_detection', data)
+
+
+@sio.on('console')
+async def handle_console(sid: str, data: Dict):
+    """Receive console output"""
+    session = _get_session_for_robot(sid)
+    if not session:
+        return
+    await broadcast_to_ui(session.session_id, 'console', data)
+
+
+# ============================================================================
+# UI Event Handlers
+# ============================================================================
 
 @sio.on('join_session')
-async def ui_join_session(sid: str, data: Dict):
+async def handle_join_session(sid: str, data: Dict):
     """
-    UI client joins a robot session to receive sensor data.
-
-    Args:
-        data: {'session_id': str}
+    UI client joins a robot session.
+    Creates session if it doesn't exist (UI may connect before robot).
+    Sends robot_ready immediately if session is already active.
     """
-    session_id = data.get('session_id')
+    session_id = data.get('session_id') if data else None
 
     if not session_id:
         await sio.emit('error', {'message': 'session_id required'}, room=sid)
         return
 
-    session = session_state.get_session(session_id)
-    if not session:
-        await sio.emit('error', {'message': f'Session {session_id} not found'}, room=sid)
-        return
+    # Create session if it doesn't exist yet
+    if session_id not in sessions:
+        sessions[session_id] = Session(session_id=session_id)
 
-    # Add UI client to session
-    session_state.add_ui_client(session_id, sid)
+    session = sessions[session_id]
+
+    # Add UI client
+    if sid not in session.ui_sids:
+        session.ui_sids.append(sid)
+    ui_sid_to_session[sid] = session_id
+
+    logger.info(f"[UI] Client {sid} joined session {session_id} (state: {session.state})")
 
     # Send current session state
     await sio.emit('session_state', {
         'session_id': session_id,
-        'phase': session.get('phase'),
-        'setup_complete': session.get('setup_complete'),
-        'remote_control_enabled': session.get('remote_control_enabled'),
-        'sensor_data': session.get('sensor_data', {})
+        'state': session.state,
+        'robot_connected': session.robot_sid is not None,
+        'sensor_data': session.sensor_data
     }, room=sid)
 
-    logger.info(f"[UI] Client {sid} joined session {session_id}")
+    # If session is already active, send robot_ready immediately
+    if session.is_active():
+        await sio.emit('robot_ready', {
+            'session_id': session_id,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room=sid)
+
+
+@sio.on('move_command')
+async def handle_move_command(sid: str, data: Dict):
+    """UI sends movement command to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        await sio.emit('error', {'message': 'Not in a session'}, room=sid)
+        return
+
+    session = sessions.get(session_id)
+    if not session or session.state != 'active':
+        await sio.emit('error', {'message': 'Session not active'}, room=sid)
+        return
+
+    if not session.robot_sid:
+        await sio.emit('error', {'message': 'Robot not connected'}, room=sid)
+        return
+
+    # Forward to robot (root namespace, no namespace param)
+    await sio.emit('move_cmd', data, room=session.robot_sid)
 
 
 @sio.on('move_cmd')
-async def ui_move_command(sid: str, data: Dict):
-    """UI sends movement command to robot"""
-    session_id = data.get('session_id')
-
-    session = session_state.get_session(session_id)
-    if not session or not session.get('remote_control_enabled'):
-        await sio.emit('error', {'message': 'Remote control not enabled'}, room=sid)
+async def handle_move_cmd(sid: str, data: Dict):
+    """UI sends move_cmd (alternate event name)."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        # Could be from robot — check robot lookup
+        session = _get_session_for_robot(sid)
+        if session:
+            # Robot is echoing back — ignore or forward to UI
+            return
         return
 
-    robot_sid = session_state.get_robot_sid(session_id)
-    if not robot_sid:
-        await sio.emit('error', {'message': 'Robot not connected'}, room=sid)
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
         return
 
-    # Forward to robot
-    namespace = f'/sessions/{session_id}/robot'
-    await sio.emit('move_cmd', data, room=robot_sid, namespace=namespace)
+    await sio.emit('move_cmd', data, room=session.robot_sid)
 
-    logger.info(f"[Command] Move command sent to robot: linear_x={data.get('linear_x')}, angular_z={data.get('angular_z')}")
+
+@sio.on('stop_command')
+async def handle_stop_command(sid: str, data: Dict = None):
+    """UI sends stop command to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
+        return
+
+    await sio.emit('move_cmd', {
+        'type': 'twist',
+        'linear_x': 0.0,
+        'angular_z': 0.0
+    }, room=session.robot_sid)
 
 
 @sio.on('stop_cmd')
-async def ui_stop_command(sid: str, data: Dict):
-    """UI sends stop command to robot"""
-    session_id = data.get('session_id')
-
-    session = session_state.get_session(session_id)
-    if not session:
-        await sio.emit('error', {'message': 'Session not found'}, room=sid)
+async def handle_stop_cmd(sid: str, data: Dict = None):
+    """UI sends stop_cmd (alternate event name)."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
         return
 
-    robot_sid = session_state.get_robot_sid(session_id)
-    if not robot_sid:
-        await sio.emit('error', {'message': 'Robot not connected'}, room=sid)
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
         return
 
-    # Forward to robot
-    namespace = f'/sessions/{session_id}/robot'
-    await sio.emit('stop_cmd', data, room=robot_sid, namespace=namespace)
+    await sio.emit('stop_cmd', data or {}, room=session.robot_sid)
 
-    logger.info(f"[Command] Stop command sent to robot")
+
+@sio.on('twist_command')
+async def handle_twist_command(sid: str, data: Dict):
+    """Forward twist command from UI to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
+        return
+
+    await sio.emit('twist_command', data, room=session.robot_sid)
+
+
+@sio.on('navigate_to_pose')
+async def handle_navigate_to_pose(sid: str, data: Dict):
+    """Forward navigation command from UI to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
+        return
+
+    await sio.emit('navigate_to_pose', data, room=session.robot_sid)
+
+
+@sio.on('cancel_navigation')
+async def handle_cancel_navigation(sid: str, data: Dict = None):
+    """Forward cancel navigation from UI to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
+        return
+
+    await sio.emit('cancel_navigation', data or {}, room=session.robot_sid)
+
+
+@sio.on('test_command')
+async def handle_test_command(sid: str, data: Dict = None):
+    """Forward test command from UI to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
+        return
+
+    await sio.emit('test_command', data or {}, room=session.robot_sid)
+
+
+@sio.on('test_ws')
+async def handle_test_ws(sid: str, data: Dict = None):
+    """Forward test WS message to robot app's UI handler."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if session and session.robot_app:
+        session.robot_app.ui.get_transport().inject_message(data or {})
+
+
+@sio.on('occupancy_grid')
+async def handle_occupancy_grid(sid: str, data: Dict):
+    """Forward occupancy grid from UI to robot."""
+    session_id = ui_sid_to_session.get(sid)
+    if not session_id:
+        return
+
+    session = sessions.get(session_id)
+    if not session or not session.robot_sid:
+        return
+
+    await sio.emit('occupancy_grid', data, room=session.robot_sid)
 
 
 # ============================================================================
-# REST API Endpoints (from RPC_v2)
+# REST API Endpoints
 # ============================================================================
-
-class NavigateToPoseCommand(BaseModel):
-    session_id: str
-    x: float
-    y: float
-    z: float = 0.0
-    qx: float = 0.0
-    qy: float = 0.0
-    qz: float = 0.0
-    qw: float = 1.0
-    frame_id: str = "map"
-    relative: bool = False
-
 
 @app.get("/api")
 async def root():
     """Health check endpoint"""
     return {
         "app": "Remake RPC",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "protocol": "APP_ROBOT_PROTOCOL v1.0",
         "status": "running"
     }
 
@@ -716,7 +858,7 @@ async def health():
     """Detailed health check for platform"""
     return {
         "status": "healthy",
-        "active_sessions": len(session_state.sessions),
+        "active_sessions": len(sessions),
         "timestamp": datetime.utcnow().isoformat()
     }
 
@@ -724,23 +866,22 @@ async def health():
 @app.get("/api/sessions")
 async def list_sessions():
     """List all active sessions"""
-    sessions = []
-    for session_id, session_data in session_state.sessions.items():
-        sessions.append({
+    result = []
+    for session_id, session in sessions.items():
+        result.append({
             'session_id': session_id,
-            'connected_at': session_data.get('connected_at'),
-            'phase': session_data.get('phase'),
-            'setup_complete': session_data.get('setup_complete'),
-            'remote_control_enabled': session_data.get('remote_control_enabled'),
-            'ui_clients': len(session_state.get_ui_clients(session_id))
+            'connected_at': session.connected_at,
+            'state': session.state,
+            'robot_connected': session.robot_sid is not None,
+            'ui_clients': len(session.ui_sids)
         })
-    return {'sessions': sessions}
+    return {'sessions': result}
 
 
 @app.get("/api/sessions/{session_id}")
 async def get_session(session_id: str):
     """Get session details"""
-    session = session_state.get_session(session_id)
+    session = sessions.get(session_id)
     if not session:
         return JSONResponse(
             status_code=404,
@@ -748,20 +889,23 @@ async def get_session(session_id: str):
         )
 
     return {
-        'session': session,
-        'ui_clients': len(session_state.get_ui_clients(session_id))
+        'session_id': session.session_id,
+        'state': session.state,
+        'robot_connected': session.robot_sid is not None,
+        'ui_clients': len(session.ui_sids),
+        'connected_at': session.connected_at
     }
 
 
 @app.get("/api/object_detection/objects")
 async def get_detected_objects(session_id: str):
     """Get list of currently detected objects"""
-    robot_app = session_state.get_robot_app(session_id)
-    if robot_app:
+    session = sessions.get(session_id)
+    if session and session.robot_app:
         return {
-            "objects": robot_app.object_detector.get_detected_objects(),
-            "summary": robot_app.object_detector.get_objects_summary(),
-            "features": robot_app.object_detector.get_features_for_ui()
+            "objects": session.robot_app.object_detector.get_detected_objects(),
+            "summary": session.robot_app.object_detector.get_objects_summary(),
+            "features": session.robot_app.object_detector.get_features_for_ui()
         }
     return {"objects": [], "summary": {"total_objects": 0}, "features": []}
 
@@ -769,15 +913,18 @@ async def get_detected_objects(session_id: str):
 @app.get("/api/robot/status")
 async def robot_status(session_id: str):
     """Get robot connection status"""
-    session = session_state.get_session(session_id)
+    session = sessions.get(session_id)
     return {
-        "connected": session is not None,
-        "ui_clients": len(session_state.get_ui_clients(session_id)) if session else 0,
-        "remote_control_enabled": session.get('remote_control_enabled') if session else False
+        "connected": session is not None and session.robot_sid is not None,
+        "ui_clients": len(session.ui_sids) if session else 0,
+        "state": session.state if session else None
     }
 
 
-# Serve frontend static files (if available)
+# ============================================================================
+# Static File Serving
+# ============================================================================
+
 static_path = Path(__file__).parent / "static"
 if static_path.exists():
     app.mount("/assets", StaticFiles(directory=static_path / "assets"), name="assets")
@@ -797,21 +944,21 @@ if static_path.exists():
 if __name__ == "__main__":
     logger.info(f"""
 +==============================================================+
-|                    Remake RPC Server                         |
+|                    Remake RPC Server v2.0                     |
 |                                                              |
 |  Port: {Config.PORT}                                              |
 |  App ID: {Config.APP_ID}                                   |
 |  Appstore: {Config.APPSTORE_URL}          |
 |                                                              |
-|  WebSocket Endpoints:                                        |
-|    /sessions/{{sessionId}}/robot  - Robot connection         |
-|    /                              - UI clients               |
+|  Protocol: APP_ROBOT_PROTOCOL v1.0                           |
+|  WebSocket: Root namespace /                                 |
+|    Robot: auth={{type:'robot', session_id, session_token}}    |
+|    UI:    join_session {{session_id}}                         |
 |                                                              |
-|  Features:                                                   |
-|    - Three-phase protocol                                    |
-|    - Object detection (RANSAC V4 + ML)                       |
-|    - Chat interface (AppstoreBridge)                         |
-|    - Sensor visualization                                    |
+|  Flow: start_protocol -> app_signature ->                    |
+|    signature_verified -> setup_app_cmd ->                     |
+|    setup_app_response -> enable_remote_control_response ->   |
+|    robot_ready                                               |
 +==============================================================+
     """)
 
