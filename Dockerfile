@@ -57,6 +57,10 @@ COPY backend/ ./
 # Copy built frontend from stage 1
 COPY --from=frontend-builder /app/frontend/dist ./static
 
+# Run as non-root user
+RUN useradd -m appuser
+USER appuser
+
 # Expose port (dynamic via environment variable)
 EXPOSE 8080
 
